@@ -1,0 +1,14 @@
+# Sécurité : Ne jamais uploader les clés API
+.env
+
+# Système : Ne pas uploader l'environnement virtuel (trop lourd et inutile)
+venv/
+.venv/
+
+# Python : Cache et fichiers compilés
+__pycache__/
+*.pyc
+
+# Base de données vectorielle (Chroma crée ce dossier)
+chroma_db/
+
