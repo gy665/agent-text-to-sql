@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import pandas as pd
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_community.utilities import SQLDatabase
@@ -20,7 +21,8 @@ TABLE_DESCRIPTIONS = [
     "Table 'clients': Contient les infos utilisateurs (nom, email, pays, type d'abonnement VIP/Free).",
     "Table 'sales': Contient l'historique des ventes (date, montant, catégorie produit, id client)."
 ]
-#chercheur de Tables(scout)
+
+# 2. Chercheur de Tables (Scout)
 @st.cache_resource
 def get_table_retriever():
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -28,7 +30,7 @@ def get_table_retriever():
     vectorstore = Chroma.from_documents(docs, embeddings)
     return vectorstore
 
-# 3. La "Mémoire" (Few-Shot Examples) - Comme avant
+# 3. La "Mémoire" (Few-Shot Examples)
 @st.cache_resource
 def get_few_shot_selector():
     examples = [
@@ -43,24 +45,19 @@ def get_few_shot_selector():
     )
     return selector
 
-#initialisation des ressources 
-
+# Initialisation des ressources 
 table_retriever = get_table_retriever()
 example_selector = get_few_shot_selector()
 
-
-
-
-
-
-# 2. Interface de Chat
+# 4. Interface de Chat
 if "messages" not in st.session_state:
     st.session_state["messages"] = [{"role": "assistant", "content": "Bonjour ! Pose-moi une question sur tes ventes ou tes clients."}]
 
 # Afficher l'historique
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
-
+    if "chart_data" in msg:
+        st.bar_chart(msg["chart_data"])
     
 # Zone de saisie utilisateur
 user_query = st.chat_input("Ex: Quel est le client qui a le plus acheté ?")
@@ -79,23 +76,24 @@ if user_query:
             if table: selected_tables.append(table)
         selected_tables = list(set(selected_tables))
         
-        # Sécurité : Si aucune table trouvée, on met 'sales' par défaut ou on arrête
+        # Sécurité : Si aucune table trouvée, on met 'sales' par défaut
         if not selected_tables:
             selected_tables = ['sales', 'clients']
 
         # 2. CONNEXION RESTREINTE
         db = SQLDatabase.from_uri("sqlite:///sales.db", include_tables=selected_tables)
         
-        # 3. EXTRACTION DU SCHÉMA RÉEL (La "Magic Touch" de la V5 intégrée dans la V3)
-        # On récupère le CREATE TABLE précis pour les tables sélectionnées
+        # 3. EXTRACTION DU SCHÉMA RÉEL
         real_schema_info = db.get_table_info(selected_tables)
 
         # 4. FEW-SHOT
         related_examples = example_selector.select_examples({"input": user_query})
-        examples_str = "\n".join([f"- User: {ex['input']}\n  SQL: {ex['query']}" for ex in related_examples])
+        examples_str = "\n".join([
+            f"- User: {ex.get('input', '')}\n  SQL: {ex.get('query', '')}" 
+            for ex in related_examples
+        ])
 
         # 5. PROMPT D'INGÉNIEUR
-        # On combine : Instructions + Schéma Réel (DDL) + Exemples
         system_prompt = f"""
         Tu es un expert SQL.
         
@@ -111,41 +109,72 @@ if user_query:
         --- INSTRUCTIONS ---
         1. Si l'utilisateur demande "articles", utilise la colonne texte (ex: product_category) vue dans le schéma ci-dessus.
         2. Ne fais pas de suppositions. Lis le schéma ci-dessus.
-        3. Si la question est hors sujet, dis "Je ne sais pas".
+        3. Si la question est hors sujet (ex: definition SQL), réponds juste avec du texte sans faire de SQL.
         """
         try:
             llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
             toolkit = SQLDatabaseToolkit(db=db, llm=llm)
             
+            # --- CORRECTION MAJEURE ICI ---
             agent_executor = create_sql_agent(
                 llm=llm,
                 toolkit=toolkit,
                 verbose=True,
                 agent_type="tool-calling",
                 handle_parsing_errors=True,
-                # On injecte le contexte riche ici
-                prefix=system_prompt
-
-                
+                prefix=system_prompt,
+                # C'est ici qu'il fallait mettre l'argument !
+                agent_executor_kwargs={"return_intermediate_steps": True}
             )
             
             response = agent_executor.invoke({"input": user_query})
             result = response['output']
 
-           
-            
+            # --- AFFICHER LE TEXTE D'ABORD (Sécurité) ---
             st.session_state.messages.append({"role": "assistant", "content": result})
             st.chat_message("assistant").write(result)
 
+            # --- ANALYSE POUR GRAPHIQUE ---
+            chart_data = None
+            sql_query = None
             
+            # On vérifie si intermediate_steps existe avant de boucler
+            if "intermediate_steps" in response:
+                for step in response["intermediate_steps"]:
+                    # step est un tuple (AgentAction, Observation)
+                    if step[0].tool == "sql_db_query":
+                        sql_query = step[0].tool_input
+
+            # Si on a trouvé du SQL, on essaie de faire un graphique
+            if sql_query:
+                if isinstance(sql_query, dict): sql_query = sql_query.get('query', str(sql_query))
+                sql_query = str(sql_query).replace("```sql", "").replace("```", "").strip()
+                
+                try:
+                    df = pd.read_sql(sql_query, db._engine)
+                    # Condition stricte pour éviter les bugs : Plus d'1 ligne ET au moins 2 colonnes
+                    if len(df) > 1 and len(df.columns) >= 2:
+                        # Si la 1ère colonne est du texte, on l'utilise comme index (axe X)
+                        if df.dtypes[0] == 'object' or df.dtypes[0] == 'string':
+                            df = df.set_index(df.columns[0])
+                        chart_data = df
+                except Exception as e:
+                    pass # Pas de graphique si erreur, c'est pas grave
+
+            # Affichage du graphique si disponible
+            if chart_data is not None:
+                st.bar_chart(chart_data)
+                # Sauvegarde du graphique
+                st.session_state.messages[-1]["chart_data"] = chart_data
             
-            # Debug pour comprendre ce qui s'est passé
+            # Debug
             with st.expander("🛠️ Voir le Cerveau (Debug)"):
                 st.write(f"**Tables choisies :** {selected_tables}")
-                st.write("**Schéma injecté (La sécurité) :**")
+                st.write("**Schéma injecté :**")
                 st.code(real_schema_info, language="sql")
-                st.write("**Exemples utilisés :**")
-                st.text(examples_str)
+                if sql_query:
+                    st.write("**SQL Généré :**")
+                    st.code(sql_query, language="sql")
 
         except Exception as e:
-            st.error(f"Oups : {e}")
+            st.error(f"Une erreur est survenue : {e}")
