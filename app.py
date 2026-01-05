@@ -1,7 +1,8 @@
 import streamlit as st
 import os
+import sqlite3
 import pandas as pd
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from langchain_groq import ChatGroq
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit, create_sql_agent
@@ -14,15 +15,88 @@ from langchain_core.documents import Document
 st.set_page_config(page_title="Agent SQL AI", page_icon="🤖")
 st.title("🤖 Chat avec ta Base de Données")
 
-# 1. Setup
-load_dotenv()
+# ==========================================
+# 1. SETUP CLÉ API (BLINDÉ)
+# ==========================================
+load_dotenv(find_dotenv())
+
+api_key = os.getenv("GROQ_API_KEY")
+if not api_key:
+    try:
+        api_key = st.secrets["GROQ_API_KEY"]
+    except:
+        pass
+
+# On force la variable d'environnement pour que la librairie ChatGroq soit contente
+if api_key:
+    os.environ["GROQ_API_KEY"] = api_key
+else:
+    st.error("🚨 Clé API introuvable ! Configurez GROQ_API_KEY dans .env ou les Secrets Streamlit.")
+    st.stop()
+
+# ==========================================
+# 2. GÉNÉRATION AUTOMATIQUE DB (TA SOLUTION)
+# ==========================================
+# Si le fichier n'existe pas (cas du Cloud), on le crée à la volée !
+if not os.path.exists("sales.db"):
+    with st.spinner("🛠️ Initialisation de la base de données sur le Cloud..."):
+        conn = sqlite3.connect('sales.db')
+        cursor = conn.cursor()
+        
+        # Création Tables
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS clients (
+            client_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT,
+            country TEXT NOT NULL,
+            subscription_type TEXT CHECK(subscription_type IN ('Free', 'Premium', 'VIP'))
+        )
+        ''')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sales (
+            sale_id INTEGER PRIMARY KEY,
+            client_id INTEGER,
+            sale_date DATE NOT NULL,
+            amount DECIMAL(10, 2) NOT NULL,
+            product_category TEXT NOT NULL,
+            FOREIGN KEY (client_id) REFERENCES clients (client_id)
+        )
+        ''')
+        
+        # Insertion Données
+        clients_data = [
+            (1, 'Alice Dupont', 'alice@example.com', 'France', 'VIP'),
+            (2, 'Bob Martin', 'bob@example.com', 'Canada', 'Premium'),
+            (3, 'Charlie Smith', 'charlie@example.com', 'USA', 'Free'),
+            (4, 'David Lee', 'david@example.com', 'France', 'Premium'),
+            (5, 'Eve Tran', 'eve@example.com', 'Vietnam', 'VIP')
+        ]
+        cursor.executemany('INSERT OR IGNORE INTO clients VALUES (?,?,?,?,?)', clients_data)
+        
+        sales_data = [
+            (101, 1, '2023-01-15', 150.00, 'Electronics'),
+            (102, 1, '2023-02-10', 300.50, 'Books'),
+            (103, 2, '2023-03-05', 1200.00, 'Furniture'),
+            (104, 3, '2023-01-20', 25.00, 'Books'),
+            (105, 4, '2023-04-12', 450.00, 'Electronics'),
+            (106, 5, '2023-05-30', 900.00, 'Electronics'),
+            (107, 1, '2023-06-01', 50.00, 'Accessories')
+        ]
+        cursor.executemany('INSERT OR IGNORE INTO sales VALUES (?,?,?,?,?)', sales_data)
+        conn.commit()
+        conn.close()
+        st.success("✅ Base de données générée avec succès !")
+
+# ==========================================
+# 3. CONFIGURATION AGENT & RAG
+# ==========================================
 
 TABLE_DESCRIPTIONS = [
     "Table 'clients': Contient les infos utilisateurs (nom, email, pays, type d'abonnement VIP/Free).",
     "Table 'sales': Contient l'historique des ventes (date, montant, catégorie produit, id client)."
 ]
 
-# 2. Chercheur de Tables (Scout)
 @st.cache_resource
 def get_table_retriever():
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -30,7 +104,6 @@ def get_table_retriever():
     vectorstore = Chroma.from_documents(docs, embeddings)
     return vectorstore
 
-# 3. La "Mémoire" (Few-Shot Examples)
 @st.cache_resource
 def get_few_shot_selector():
     examples = [
@@ -45,21 +118,21 @@ def get_few_shot_selector():
     )
     return selector
 
-# Initialisation des ressources 
 table_retriever = get_table_retriever()
 example_selector = get_few_shot_selector()
 
-# 4. Interface de Chat
-if "messages" not in st.session_state:
-    st.session_state["messages"] = [{"role": "assistant", "content": "Bonjour ! Pose-moi une question sur tes ventes ou tes clients."}]
+# ==========================================
+# 4. INTERFACE CHAT
+# ==========================================
 
-# Afficher l'historique
+if "messages" not in st.session_state:
+    st.session_state["messages"] = [{"role": "assistant", "content": "Bonjour ! Je suis connecté à la base de données. Pose ta question."}]
+
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
     if "chart_data" in msg:
         st.bar_chart(msg["chart_data"])
     
-# Zone de saisie utilisateur
 user_query = st.chat_input("Ex: Quel est le client qui a le plus acheté ?")
 
 if user_query:
@@ -68,54 +141,36 @@ if user_query:
 
     with st.spinner("🧠 Réflexion en cours..."):
         
-        # 1. SCOUT : Trouver les tables
+        # SCOUT
         found_docs = table_retriever.similarity_search(user_query, k=2)
-        selected_tables = []
-        for doc in found_docs:
-            table = doc.metadata.get('table_name')
-            if table: selected_tables.append(table)
-        selected_tables = list(set(selected_tables))
-        
-        # Sécurité : Si aucune table trouvée, on met 'sales' par défaut
-        if not selected_tables:
-            selected_tables = ['sales', 'clients']
+        selected_tables = list(set([doc.metadata.get('table_name') for doc in found_docs if doc.metadata.get('table_name')]))
+        if not selected_tables: selected_tables = ['sales', 'clients']
 
-        # 2. CONNEXION RESTREINTE
+        # CONNEXION
         db = SQLDatabase.from_uri("sqlite:///sales.db", include_tables=selected_tables)
-        
-        # 3. EXTRACTION DU SCHÉMA RÉEL
         real_schema_info = db.get_table_info(selected_tables)
 
-        # 4. FEW-SHOT
+        # FEW-SHOT
         related_examples = example_selector.select_examples({"input": user_query})
-        examples_str = "\n".join([
-            f"- User: {ex.get('input', '')}\n  SQL: {ex.get('query', '')}" 
-            for ex in related_examples
-        ])
+        examples_str = "\n".join([f"- User: {ex.get('input','')}\n  SQL: {ex.get('query','')}" for ex in related_examples])
 
-        # 5. PROMPT D'INGÉNIEUR
+        # PROMPT
         system_prompt = f"""
         Tu es un expert SQL.
-        
-        --- INFO CRITIQUE : SCHÉMA DE LA BASE ---
-        Voici la définition exacte des tables que tu dois utiliser.
-        N'utilise JAMAIS une colonne qui n'est pas écrite ici :
-        
-        {real_schema_info}
-        
-        --- EXEMPLES PERTINENTS ---
-        {examples_str}
-        
-        --- INSTRUCTIONS ---
-        1. Si l'utilisateur demande "articles", utilise la colonne texte (ex: product_category) vue dans le schéma ci-dessus.
-        2. Ne fais pas de suppositions. Lis le schéma ci-dessus.
-        3. Si la question est hors sujet (ex: definition SQL), réponds juste avec du texte sans faire de SQL.
+        SCHEMA: {real_schema_info}
+        EXEMPLES: {examples_str}
+        INSTRUCTIONS:
+        1. Utilise le schéma ci-dessus.
+        2. Si on demande "articles", utilise 'product_category'.
+        3. Réponds uniquement avec du SQL ou du texte explicatif si hors-sujet.
         """
+        
         try:
+            # ON NE PASSE PLUS api_key=... CAR C'EST DANS OS.ENVIRON
             llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+            
             toolkit = SQLDatabaseToolkit(db=db, llm=llm)
             
-            # --- CORRECTION MAJEURE ICI ---
             agent_executor = create_sql_agent(
                 llm=llm,
                 toolkit=toolkit,
@@ -123,58 +178,41 @@ if user_query:
                 agent_type="tool-calling",
                 handle_parsing_errors=True,
                 prefix=system_prompt,
-                # C'est ici qu'il fallait mettre l'argument !
                 agent_executor_kwargs={"return_intermediate_steps": True}
             )
             
             response = agent_executor.invoke({"input": user_query})
             result = response['output']
 
-            # --- AFFICHER LE TEXTE D'ABORD (Sécurité) ---
             st.session_state.messages.append({"role": "assistant", "content": result})
             st.chat_message("assistant").write(result)
 
-            # --- ANALYSE POUR GRAPHIQUE ---
+            # GRAPHIQUE
             chart_data = None
             sql_query = None
-            
-            # On vérifie si intermediate_steps existe avant de boucler
             if "intermediate_steps" in response:
                 for step in response["intermediate_steps"]:
-                    # step est un tuple (AgentAction, Observation)
                     if step[0].tool == "sql_db_query":
                         sql_query = step[0].tool_input
-
-            # Si on a trouvé du SQL, on essaie de faire un graphique
+            
             if sql_query:
                 if isinstance(sql_query, dict): sql_query = sql_query.get('query', str(sql_query))
                 sql_query = str(sql_query).replace("```sql", "").replace("```", "").strip()
-                
                 try:
                     df = pd.read_sql(sql_query, db._engine)
-                    # Condition stricte pour éviter les bugs : Plus d'1 ligne ET au moins 2 colonnes
                     if len(df) > 1 and len(df.columns) >= 2:
-                        # Si la 1ère colonne est du texte, on l'utilise comme index (axe X)
                         if df.dtypes[0] == 'object' or df.dtypes[0] == 'string':
                             df = df.set_index(df.columns[0])
                         chart_data = df
-                except Exception as e:
-                    pass # Pas de graphique si erreur, c'est pas grave
+                except: pass
 
-            # Affichage du graphique si disponible
             if chart_data is not None:
                 st.bar_chart(chart_data)
-                # Sauvegarde du graphique
                 st.session_state.messages[-1]["chart_data"] = chart_data
-            
-            # Debug
-            with st.expander("🛠️ Voir le Cerveau (Debug)"):
-                st.write(f"**Tables choisies :** {selected_tables}")
-                st.write("**Schéma injecté :**")
-                st.code(real_schema_info, language="sql")
-                if sql_query:
-                    st.write("**SQL Généré :**")
-                    st.code(sql_query, language="sql")
+
+            with st.expander("🛠️ Debug"):
+                st.write(f"Tables: {selected_tables}")
+                st.code(real_schema_info)
 
         except Exception as e:
-            st.error(f"Une erreur est survenue : {e}")
+            st.error(f"Erreur : {e}")
